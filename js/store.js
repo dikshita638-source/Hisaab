@@ -1,16 +1,11 @@
-/*
- * HISAAB — store.js
- * Owns the application state, validation and Local Storage persistence.
- * Every create / edit / delete operation goes through this file.
- */
 (function (global) {
   'use strict';
 
   var Core = global.HisaabCore;
-  var STORAGE_KEY = 'hisaab_data_v1';
+  var API_BASE = (global.HISAAB_API_BASE || 'http://localhost:8080/api').replace(/\/+$/, '');
   var ME = 'me';
-  var persistent = true;
-  var state = loadState();
+  var connected = false;
+  var state = createDefaultState();
 
   function createDefaultState() {
     return {
@@ -29,122 +24,178 @@
       .slice(0, maxLength || 60);
   }
 
-  function normalizeState(raw) {
-    var data = raw && typeof raw === 'object' ? raw : {};
-    var profile = data.profile && typeof data.profile === 'object' ? data.profile : {};
-    var currency = Core.CURRENCIES[profile.currency] ? profile.currency : 'INR';
+  async function request(path, options) {
+    var opts = options || {};
+    var config = {
+      method: opts.method || 'GET',
+      headers: { 'Content-Type': 'application/json' }
+    };
 
-    var groups = Array.isArray(data.groups) ? data.groups.filter(function (group) {
-      return group && typeof group === 'object' && group.id && group.name && Array.isArray(group.members);
-    }).map(function (group) {
-      var seen = {};
-      var members = group.members.filter(function (member) {
-        if (!member || !member.id || !cleanName(member.name)) return false;
-        if (seen[member.id]) return false;
-        seen[member.id] = true;
-        return true;
-      }).map(function (member) {
-        return { id: String(member.id), name: cleanName(member.name, 40) };
-      });
+    if (opts.body != null) {
+      config.body = JSON.stringify(opts.body);
+    }
 
+    var response;
+    try {
+      response = await global.fetch(API_BASE + path, config);
+    } catch (error) {
+      connected = false;
+      throw new Error('Could not reach the HISAAB server.');
+    }
+
+    var text = await response.text();
+    var data = null;
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch (error) {
+        data = null;
+      }
+    }
+
+    if (!response.ok) {
+      var message = data && (data.message || data.error);
+      throw new Error(message || ('Request failed with status ' + response.status + '.'));
+    }
+
+    connected = true;
+    return data;
+  }
+
+  function mapProfile(profile) {
+    var data = profile && typeof profile === 'object' ? profile : {};
+    var currency = Core.CURRENCIES[data.currency] ? data.currency : 'INR';
+    return {
+      name: cleanName(data.displayName, 40) || 'Aarav',
+      currency: currency
+    };
+  }
+
+  function mapGroup(group) {
+    var members = (group.members || []).map(function (member) {
       return {
-        id: String(group.id),
-        name: cleanName(group.name, 60),
-        createdAt: group.createdAt || new Date().toISOString(),
-        members: members
+        id: String(member.id),
+        backendId: member.id,
+        name: cleanName(member.name, 40),
+        currentUser: member.currentUser === true
       };
-    }).filter(function (group) {
-      return group.members.length >= 2;
-    }) : [];
-
-    var validGroupIds = {};
-    var validMemberIds = {};
-    groups.forEach(function (group) {
-      validGroupIds[group.id] = true;
-      group.members.forEach(function (member) { validMemberIds[member.id] = true; });
     });
 
-    var expenses = Array.isArray(data.expenses) ? data.expenses.filter(function (expense) {
-      return expense && typeof expense === 'object' &&
-        validGroupIds[expense.groupId] &&
-        validMemberIds[expense.paidBy] &&
-        Core.isValidISODate(expense.date) &&
-        isFinite(Number(expense.amount)) && Number(expense.amount) > 0 &&
-        Array.isArray(expense.participants);
-    }).map(function (expense) {
-      var participants = [];
-      expense.participants.forEach(function (id) {
-        if (validMemberIds[id] && participants.indexOf(id) === -1) participants.push(String(id));
+    var current = members.find(function (member) { return member.currentUser; });
+    if (!current) {
+      var profileName = state.profile.name.toLowerCase();
+      current = members.find(function (member) {
+        return member.name.toLowerCase() === profileName;
       });
-      return {
-        id: String(expense.id || Core.uid('exp')),
-        groupId: String(expense.groupId),
-        description: cleanName(expense.description, 90),
-        amount: Core.roundMoney(expense.amount),
-        paidBy: String(expense.paidBy),
-        date: expense.date,
-        participants: participants,
-        createdAt: expense.createdAt || new Date().toISOString()
-      };
-    }).filter(function (expense) {
-      return expense.description && expense.participants.length > 0;
-    }) : [];
+    }
 
-    var settlements = Array.isArray(data.settlements) ? data.settlements.filter(function (settlement) {
-      return settlement && typeof settlement === 'object' &&
-        validGroupIds[settlement.groupId] &&
-        validMemberIds[settlement.from] &&
-        validMemberIds[settlement.to] &&
-        settlement.from !== settlement.to &&
-        isFinite(Number(settlement.amount)) && Number(settlement.amount) > 0 &&
-        Core.isValidISODate(settlement.date);
-    }).map(function (settlement) {
-      return {
-        id: String(settlement.id || Core.uid('set')),
-        groupId: String(settlement.groupId),
-        from: String(settlement.from),
-        to: String(settlement.to),
-        amount: Core.roundMoney(settlement.amount),
-        date: settlement.date,
-        createdAt: settlement.createdAt || new Date().toISOString()
-      };
-    }) : [];
+    if (current) {
+      members.forEach(function (member) {
+        member.id = member === current ? ME : String(member.backendId);
+        member.currentUser = member === current;
+      });
+    }
+
+    return {
+      id: String(group.id),
+      name: cleanName(group.name, 60),
+      description: group.description || '',
+      inviteCode: group.inviteCode || '',
+      createdAt: group.createdAt || new Date().toISOString(),
+      members: members
+    };
+  }
+
+  function frontendMemberId(group, backendId) {
+    var member = group.members.find(function (item) {
+      return String(item.backendId) === String(backendId);
+    });
+    return member ? member.id : String(backendId);
+  }
+
+  function mapExpense(expense, group) {
+    var participants = [];
+    (expense.shares || []).forEach(function (share) {
+      var id = frontendMemberId(group, share.memberId);
+      if (participants.indexOf(id) === -1) participants.push(id);
+    });
+
+    return {
+      id: String(expense.id),
+      groupId: String(expense.groupId),
+      description: cleanName(expense.description, 90),
+      amount: Core.roundMoney(expense.amount),
+      paidBy: frontendMemberId(group, expense.paidByMemberId),
+      date: expense.expenseDate,
+      participants: participants,
+      createdAt: expense.createdAt || new Date().toISOString()
+    };
+  }
+
+  function mapPayment(payment, group) {
+    return {
+      id: String(payment.id),
+      groupId: String(payment.groupId),
+      from: frontendMemberId(group, payment.fromMemberId),
+      to: frontendMemberId(group, payment.toMemberId),
+      amount: Core.roundMoney(payment.amount),
+      date: payment.paymentDate,
+      createdAt: payment.createdAt || new Date().toISOString()
+    };
+  }
+
+  function buildState(profile, entries) {
+    var groups = entries.map(function (entry) { return mapGroup(entry.group); });
+    var groupById = {};
+    groups.forEach(function (group) { groupById[group.id] = group; });
+
+    var expenses = [];
+    var settlements = [];
+
+    entries.forEach(function (entry) {
+      var group = groupById[String(entry.group.id)];
+      if (!group) return;
+
+      (entry.expenses || []).forEach(function (expense) {
+        var mapped = mapExpense(expense, group);
+        if (mapped.description && mapped.participants.length) {
+          expenses.push(mapped);
+        }
+      });
+
+      (entry.payments || []).forEach(function (payment) {
+        settlements.push(mapPayment(payment, group));
+      });
+    });
 
     return {
       version: 1,
-      profile: {
-        name: cleanName(profile.name, 40) || 'Aarav',
-        currency: currency
-      },
+      profile: mapProfile(profile),
       groups: groups,
       expenses: expenses,
       settlements: settlements
     };
   }
 
-  function loadState() {
-    try {
-      var raw = global.localStorage.getItem(STORAGE_KEY);
-      if (!raw) return createDefaultState();
-      return normalizeState(JSON.parse(raw));
-    } catch (error) {
-      // Private browsing or file:// restrictions can disable Local Storage.
-      persistent = false;
-      console.warn('HISAAB: Local Storage is unavailable.', error);
-      return createDefaultState();
-    }
+  async function loadAll() {
+    var profile = await request('/profile');
+    state.profile = mapProfile(profile);
+
+    var groups = await request('/groups');
+    var entries = await Promise.all((groups || []).map(async function (group) {
+      var results = await Promise.all([
+        request('/groups/' + group.id + '/expenses'),
+        request('/groups/' + group.id + '/payments')
+      ]);
+      return { group: group, expenses: results[0] || [], payments: results[1] || [] };
+    }));
+
+    state = buildState(profile, entries);
+    return state;
   }
 
-  function persist() {
-    try {
-      global.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-      persistent = true;
-      return true;
-    } catch (error) {
-      persistent = false;
-      console.warn('HISAAB: could not save data.', error);
-      return false;
-    }
+  async function init() {
+    return loadAll();
   }
 
   function getState() {
@@ -163,7 +214,43 @@
     return state.settlements.filter(function (settlement) { return settlement.groupId === groupId; });
   }
 
-  function createGroup(name, memberNames) {
+  function backendMemberId(group, memberId) {
+    var member = group.members.find(function (item) { return item.id === memberId; });
+    if (!member) throw new Error('Choose a valid member.');
+    return member.backendId;
+  }
+
+  async function postMember(groupId, name, currentUser) {
+    return request('/groups/' + groupId + '/members', {
+      method: 'POST',
+      body: { name: name, currentUser: !!currentUser }
+    });
+  }
+
+  async function createGroupThroughApi(groupName, memberNames) {
+    var group = await request('/groups', {
+      method: 'POST',
+      body: { name: groupName }
+    });
+
+    try {
+      await postMember(group.id, state.profile.name, true);
+      for (var i = 0; i < memberNames.length; i++) {
+        await postMember(group.id, memberNames[i], false);
+      }
+    } catch (error) {
+      try {
+        await request('/groups/' + group.id, { method: 'DELETE' });
+      } catch (ignored) {
+        // The original error is more useful.
+      }
+      throw error;
+    }
+
+    return group;
+  }
+
+  async function createGroup(name, memberNames) {
     var groupName = cleanName(name, 60);
     if (!groupName) throw new Error('Please enter a group name.');
 
@@ -187,28 +274,17 @@
 
     if (names.length > 19) throw new Error('A group can have a maximum of 20 members.');
 
-    var group = {
-      id: Core.uid('grp'),
-      name: groupName,
-      createdAt: new Date().toISOString(),
-      members: [{ id: ME, name: state.profile.name }].concat(names.map(function (memberName) {
-        return { id: Core.uid('mem'), name: memberName };
-      }))
-    };
-
-    state.groups.unshift(group);
-    persist();
-    return group;
+    var created = await createGroupThroughApi(groupName, names);
+    await loadAll();
+    return getGroup(String(created.id));
   }
 
-  function deleteGroup(groupId) {
+  async function deleteGroup(groupId) {
     var group = getGroup(groupId);
     if (!group) throw new Error('Group not found.');
 
-    state.groups = state.groups.filter(function (item) { return item.id !== groupId; });
-    state.expenses = state.expenses.filter(function (expense) { return expense.groupId !== groupId; });
-    state.settlements = state.settlements.filter(function (settlement) { return settlement.groupId !== groupId; });
-    persist();
+    await request('/groups/' + groupId, { method: 'DELETE' });
+    await loadAll();
     return group;
   }
 
@@ -245,49 +321,57 @@
     };
   }
 
-  function addExpense(input) {
-    var clean = normalizeExpenseInput(input);
-    var expense = {
-      id: Core.uid('exp'),
-      groupId: clean.groupId,
+  function expenseBody(group, clean) {
+    return {
+      groupId: Number(group.id),
       description: clean.description,
       amount: clean.amount,
-      paidBy: clean.paidBy,
-      date: clean.date,
-      participants: clean.participants,
-      createdAt: new Date().toISOString()
+      paidByMemberId: backendMemberId(group, clean.paidBy),
+      splitType: 'EQUAL',
+      expenseDate: clean.date,
+      shares: clean.participants.map(function (id) {
+        return { memberId: backendMemberId(group, id) };
+      })
     };
-
-    state.expenses.push(expense);
-    persist();
-    return expense;
   }
 
-  function updateExpense(expenseId, input) {
+  async function addExpense(input) {
+    var clean = normalizeExpenseInput(input);
+    var group = getGroup(clean.groupId);
+    var expense = await request('/groups/' + group.id + '/expenses', {
+      method: 'POST',
+      body: expenseBody(group, clean)
+    });
+
+    await loadAll();
+    return state.expenses.find(function (item) { return item.id === String(expense.id); }) || null;
+  }
+
+  async function updateExpense(expenseId, input) {
     var expense = state.expenses.find(function (item) { return item.id === expenseId; });
     if (!expense) throw new Error('Expense not found.');
 
     var clean = normalizeExpenseInput(input);
-    expense.groupId = clean.groupId;
-    expense.description = clean.description;
-    expense.amount = clean.amount;
-    expense.paidBy = clean.paidBy;
-    expense.date = clean.date;
-    expense.participants = clean.participants;
-    persist();
-    return expense;
+    var group = getGroup(clean.groupId);
+    var saved = await request('/expenses/' + expenseId, {
+      method: 'PUT',
+      body: expenseBody(group, clean)
+    });
+
+    await loadAll();
+    return state.expenses.find(function (item) { return item.id === String(saved.id); }) || null;
   }
 
-  function deleteExpense(expenseId) {
+  async function deleteExpense(expenseId) {
     var expense = state.expenses.find(function (item) { return item.id === expenseId; });
     if (!expense) throw new Error('Expense not found.');
 
-    state.expenses = state.expenses.filter(function (item) { return item.id !== expenseId; });
-    persist();
+    await request('/expenses/' + expenseId, { method: 'DELETE' });
+    await loadAll();
     return expense;
   }
 
-  function addSettlement(input) {
+  async function addSettlement(input) {
     var group = getGroup(input.groupId);
     if (!group) throw new Error('Choose a valid group.');
 
@@ -301,129 +385,119 @@
     if (!isFinite(amount) || amount <= 0) throw new Error('Enter a payment amount greater than zero.');
     if (!Core.isValidISODate(input.date)) throw new Error('Choose a valid payment date.');
 
-    var settlement = {
-      id: Core.uid('set'),
-      groupId: group.id,
-      from: input.from,
-      to: input.to,
-      amount: amount,
-      date: input.date,
-      createdAt: new Date().toISOString()
-    };
+    var payment = await request('/groups/' + group.id + '/payments', {
+      method: 'POST',
+      body: {
+        fromMemberId: backendMemberId(group, input.from),
+        toMemberId: backendMemberId(group, input.to),
+        amount: amount,
+        paymentDate: input.date
+      }
+    });
 
-    state.settlements.push(settlement);
-    persist();
-    return settlement;
+    await loadAll();
+    return state.settlements.find(function (item) { return item.id === String(payment.id); }) || null;
   }
 
-  function deleteSettlement(settlementId) {
+  async function deleteSettlement(settlementId) {
     var settlement = state.settlements.find(function (item) { return item.id === settlementId; });
     if (!settlement) throw new Error('Payment not found.');
 
-    state.settlements = state.settlements.filter(function (item) { return item.id !== settlementId; });
-    persist();
+    await request('/payments/' + settlementId, { method: 'DELETE' });
+    await loadAll();
     return settlement;
   }
 
-  function updateProfile(input) {
+  async function updateProfile(input) {
     var name = cleanName(input.name, 40);
     if (!name) throw new Error('Please enter your name.');
     if (!Core.CURRENCIES[input.currency]) throw new Error('Choose a supported currency.');
 
-    state.profile.name = name;
-    state.profile.currency = input.currency;
-
-    // The current user is stored in every group, so keep those names in sync.
-    state.groups.forEach(function (group) {
-      group.members.forEach(function (member) {
-        if (member.id === ME) member.name = name;
-      });
+    await request('/profile', {
+      method: 'PUT',
+      body: { displayName: name, currency: input.currency }
     });
 
-    persist();
+    await loadAll();
     return state.profile;
   }
 
-  function clearFinancialData() {
-    state.groups = [];
-    state.expenses = [];
-    state.settlements = [];
-    persist();
+  async function clearFinancialData() {
+    var groups = state.groups.slice();
+    await Promise.all(groups.map(function (group) {
+      return request('/groups/' + group.id, { method: 'DELETE' });
+    }));
+    await loadAll();
   }
 
-  function addDemoData() {
+  function memberIdByName(group, name) {
+    if (name === ME) return ME;
+    var member = group.members.find(function (item) {
+      return item.name.toLowerCase() === String(name).toLowerCase();
+    });
+    return member ? member.id : null;
+  }
+
+  async function addDemoData() {
     var today = Core.todayISO();
-    var me = { id: ME, name: state.profile.name };
 
-    function member(name) {
-      return { id: Core.uid('mem'), name: name };
-    }
+    await clearFinancialData();
 
-    function group(name, people, daysAgo) {
-      return {
-        id: Core.uid('grp'),
-        name: name,
-        createdAt: new Date(Date.now() - daysAgo * 86400000).toISOString(),
-        members: [me].concat(people.map(member))
-      };
-    }
-
-    function expense(group, description, amount, paidBy, participants, dayOffset) {
-      return {
-        id: Core.uid('exp'),
-        groupId: group.id,
-        description: description,
-        amount: amount,
-        paidBy: paidBy,
-        date: Core.addDaysISO(dayOffset),
-        participants: participants,
-        createdAt: new Date(Date.now() + dayOffset * 86400000).toISOString()
-      };
-    }
-
-    var goa = group('Goa Trip 2026', ['Riya', 'Kabir', 'Meera'], 18);
-    var flat = group('Flat 402', ['Rohan', 'Sneha'], 96);
-    var office = group('Office Lunch Club', ['Priya', 'Arjun', 'Nisha'], 42);
-    var diwali = group('Diwali Party', ['Aditya', 'Tara'], 24);
-
-    var goaIds = goa.members.map(function (item) { return item.id; });
-    var flatIds = flat.members.map(function (item) { return item.id; });
-    var officeIds = office.members.map(function (item) { return item.id; });
-    var diwaliIds = diwali.members.map(function (item) { return item.id; });
-
-    state.groups = [goa, flat, office, diwali];
-
-    state.expenses = [
-      expense(goa, 'Beach shack dinner', 3200, me.id, goaIds, -2),
-      expense(goa, 'Villa booking', 12000, goa.members[2].id, goaIds, -9),
-      expense(goa, 'Water sports', 4800, goa.members[3].id,
-        [me.id, goa.members[2].id, goa.members[3].id], -1),
-      expense(goa, 'Cab to airport', 1200, goa.members[1].id, goaIds, -4),
-      expense(goa, 'Sunset cruise deposit', 2400, me.id, goaIds, 2),
-
-      expense(flat, 'Electricity bill', 3600, flat.members[1].id, flatIds, -3),
-      expense(flat, 'Internet recharge', 999, me.id, flatIds, -7),
-      expense(flat, 'Cleaning supplies', 740, flat.members[2].id, flatIds, -5),
-
-      expense(office, 'Team lunch', 2200, office.members[1].id, officeIds, -1),
-      expense(office, 'Coffee run', 680, me.id, [me.id, office.members[1].id, office.members[2].id], 0),
-      expense(office, 'Birthday cake', 1300, office.members[3].id, officeIds, -6),
-
-      expense(diwali, 'Decorations', 1850, diwali.members[1].id, diwaliIds, -8),
-      expense(diwali, 'Snacks & sweets', 3200, me.id, diwaliIds, -3)
+    var groupDefs = [
+      { key: 'goa', name: 'Goa Trip 2026', people: ['Riya', 'Kabir', 'Meera'] },
+      { key: 'flat', name: 'Flat 402', people: ['Rohan', 'Sneha'] },
+      { key: 'office', name: 'Office Lunch Club', people: ['Priya', 'Arjun', 'Nisha'] },
+      { key: 'diwali', name: 'Diwali Party', people: ['Aditya', 'Tara'] }
     ];
 
-    state.settlements = [{
-      id: Core.uid('set'),
-      groupId: flat.id,
-      from: me.id,
-      to: flat.members[1].id,
-      amount: 800,
-      date: Core.addDaysISO(-2),
-      createdAt: new Date(Date.now() - 2 * 86400000).toISOString()
-    }];
+    var groups = {};
+    for (var i = 0; i < groupDefs.length; i++) {
+      groups[groupDefs[i].key] = await createGroup(groupDefs[i].name, groupDefs[i].people);
+    }
 
-    persist();
+    var expenseDefs = [
+      ['goa', 'Beach shack dinner', 3200, ME, ['Riya', 'Kabir', 'Meera'], -2],
+      ['goa', 'Villa booking', 12000, 'Kabir', ['Riya', 'Kabir', 'Meera'], -9],
+      ['goa', 'Water sports', 4800, 'Meera', [ME, 'Kabir', 'Meera'], -1],
+      ['goa', 'Cab to airport', 1200, 'Riya', ['Riya', 'Kabir', 'Meera'], -4],
+      ['goa', 'Sunset cruise deposit', 2400, ME, ['Riya', 'Kabir', 'Meera'], 2],
+      ['flat', 'Electricity bill', 3600, 'Rohan', ['Rohan', 'Sneha'], -3],
+      ['flat', 'Internet recharge', 999, ME, ['Rohan', 'Sneha'], -7],
+      ['flat', 'Cleaning supplies', 740, 'Sneha', ['Rohan', 'Sneha'], -5],
+      ['office', 'Team lunch', 2200, 'Priya', ['Priya', 'Arjun', 'Nisha'], -1],
+      ['office', 'Coffee run', 680, ME, [ME, 'Arjun', 'Nisha'], 0],
+      ['office', 'Birthday cake', 1300, 'Nisha', ['Priya', 'Arjun', 'Nisha'], -6],
+      ['diwali', 'Decorations', 1850, 'Aditya', ['Aditya', 'Tara'], -8],
+      ['diwali', 'Snacks & sweets', 3200, ME, ['Aditya', 'Tara'], -3]
+    ];
+
+    for (var j = 0; j < expenseDefs.length; j++) {
+      var def = expenseDefs[j];
+      var group = groups[def[0]];
+      var participants = def[4].map(function (name) {
+        return memberIdByName(group, name);
+      }).filter(Boolean);
+
+      await addExpense({
+        groupId: group.id,
+        description: def[1],
+        amount: def[2],
+        paidBy: memberIdByName(group, def[3]),
+        date: Core.addDaysISO(def[5]),
+        participants: participants
+      });
+    }
+
+    var flat = groups.flat;
+    await addSettlement({
+      groupId: flat.id,
+      from: ME,
+      to: memberIdByName(flat, 'Rohan'),
+      amount: 800,
+      date: Core.addDaysISO(-2)
+    });
+
+    await loadAll();
     return { groups: state.groups.length, expenses: state.expenses.length, today: today };
   }
 
@@ -432,16 +506,15 @@
   }
 
   function reload() {
-    state = loadState();
-    return state;
+    return loadAll();
   }
 
   function storageInfo() {
     var serialized = '';
     try { serialized = JSON.stringify(state); } catch (error) { serialized = ''; }
     return {
-      persistent: persistent,
-      key: STORAGE_KEY,
+      persistent: connected,
+      key: 'HISAAB API',
       bytes: serialized.length,
       groupCount: state.groups.length,
       expenseCount: state.expenses.length,
@@ -451,7 +524,8 @@
 
   global.HisaabStore = {
     ME: ME,
-    storageKey: STORAGE_KEY,
+    storageKey: 'HISAAB_API',
+    init: init,
     getState: getState,
     getGroup: getGroup,
     getGroupExpenses: getGroupExpenses,

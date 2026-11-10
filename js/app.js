@@ -46,7 +46,7 @@
     settings: {
       kicker: 'SETTINGS',
       title: 'Make HISAAB yours.',
-      subtitle: 'Profile, currency and the data stored in this browser.',
+      subtitle: 'Profile, currency and the data saved to your HISAAB server.',
       placeholder: 'Search HISAAB...'
     }
   };
@@ -937,9 +937,9 @@
 
     var storageNote = info.persistent
       ? '<div class="storage-note">' + icon('database') +
-        '<span><strong>Saved in this browser.</strong> Groups, expenses and payments live in Local Storage under <strong>' + esc(info.key) + '</strong> (' + formatBytes(info.bytes) + ').</span></div>'
+        '<span><strong>Saved to your HISAAB server.</strong> Groups, expenses and payments live in MySQL through the <strong>' + esc(info.key) + '</strong> (' + formatBytes(info.bytes) + ').</span></div>'
       : '<div class="storage-note warning">' + icon('alert') +
-        '<span><strong>Local Storage is unavailable.</strong> You can still use HISAAB in this tab, but changes will be lost when it closes.</span></div>';
+        '<span><strong>The HISAAB server is unavailable.</strong> Check that the backend is running, then refresh this page.</span></div>';
 
     els.mainContent.innerHTML =
       '<div class="settings-grid">' +
@@ -965,7 +965,7 @@
         '<div class="settings-column">' +
           '<section class="panel settings-panel">' +
             '<h2>Your data</h2>' +
-            '<p>Everything is stored locally. No account, server or internet connection needed.</p>' +
+            '<p>Everything is saved to your HISAAB server and its MySQL database.</p>' +
             '<div class="data-stats">' +
               '<div class="data-stat"><span>Groups</span><strong>' + info.groupCount + '</strong></div>' +
               '<div class="data-stat"><span>Expenses</span><strong>' + info.expenseCount + '</strong></div>' +
@@ -985,7 +985,7 @@
             '<div class="about-list">' +
               '<div class="about-item">' + icon('check') + '<span><strong>Equal split:</strong> every expense is divided across its selected participants to the exact paise.</span></div>' +
               '<div class="about-item">' + icon('settle') + '<span><strong>Fewest payments:</strong> HISAAB matches the biggest debtor with the biggest creditor, clearing the group in at most N-1 transfers.</span></div>' +
-              '<div class="about-item">' + icon('database') + '<span><strong>Local-first:</strong> your data is saved in this browser with Local Storage. Export a backup whenever you like.</span></div>' +
+              '<div class="about-item">' + icon('database') + '<span><strong>Server-backed:</strong> your data is saved through the HISAAB API to MySQL. Export a backup whenever you like.</span></div>' +
               '<div class="about-item">' + icon('users') + '<span><strong>You are automatic:</strong> every new group includes your profile, so “you owe” and “you are owed” always make sense.</span></div>' +
             '</div>' +
             '<p class="about-signature">HISAAB · Split smart. Settle easy.</p>' +
@@ -1344,9 +1344,13 @@
 
     var button = document.getElementById('confirmActionBtn');
     if (button) {
-      button.addEventListener('click', function () {
+      button.addEventListener('click', async function () {
         closeModal();
-        options.onConfirm();
+        try {
+          await options.onConfirm();
+        } catch (error) {
+          toast(error.message, 'error');
+        }
       }, { once: true });
     }
   }
@@ -1682,9 +1686,9 @@
         '</strong>. Every balance will be recalculated.',
       confirmLabel: 'Delete expense',
       danger: true,
-      onConfirm: function () {
+      onConfirm: async function () {
         try {
-          Store.deleteExpense(expenseId);
+          await Store.deleteExpense(expenseId);
           toast('Expense deleted.', 'success');
           refreshAll();
         } catch (error) {
@@ -1711,9 +1715,9 @@
         '. This cannot be undone.',
       confirmLabel: 'Delete group',
       danger: true,
-      onConfirm: function () {
+      onConfirm: async function () {
         try {
-          Store.deleteGroup(groupId);
+          await Store.deleteGroup(groupId);
           toast('Group deleted.', 'success');
           refreshAll();
         } catch (error) {
@@ -1739,9 +1743,9 @@
         esc(memberName(group, settlement.to)) + '</strong> will be removed and balances recalculated.',
       confirmLabel: 'Delete payment',
       danger: true,
-      onConfirm: function () {
+      onConfirm: async function () {
         try {
-          Store.deleteSettlement(settlementId);
+          await Store.deleteSettlement(settlementId);
           toast('Recorded payment removed.', 'success');
           refreshAll();
         } catch (error) {
@@ -1778,9 +1782,9 @@
         ? 'This will replace your current groups, expenses and payments with four sample groups. Your profile and currency stay the same.'
         : 'This adds four sample groups, their expenses and a recorded payment so you can explore every feature. You can clear it at any time.',
       confirmLabel: hasData ? 'Replace data' : 'Load sample data',
-      onConfirm: function () {
+      onConfirm: async function () {
         try {
-          Store.addDemoData();
+          await Store.addDemoData();
           toast('Sample data loaded.', 'success');
           ui.search = '';
           if (els.search) els.search.value = '';
@@ -1796,12 +1800,12 @@
   function clearAllData() {
     confirmDialog({
       title: 'Clear all HISAAB data?',
-      message: 'Every group, expense and recorded payment will be permanently removed from this browser. Your profile and currency will be kept.',
+      message: 'Every group, expense and recorded payment will be permanently removed from your HISAAB server. Your profile and currency will be kept.',
       confirmLabel: 'Clear everything',
       danger: true,
-      onConfirm: function () {
+      onConfirm: async function () {
         try {
-          Store.clearFinancialData();
+          await Store.clearFinancialData();
           toast('All financial data cleared.', 'success');
           ui.search = '';
           if (els.search) els.search.value = '';
@@ -1976,7 +1980,7 @@
   /* Form submissions                                                   */
   /* ------------------------------------------------------------------ */
 
-  function handleSubmit(event) {
+  async function handleSubmit(event) {
     var form = event.target;
     if (!form || !form.id) return;
 
@@ -1985,7 +1989,7 @@
       hideFormError('groupFormError');
       var memberNames = $$('#memberRows .member-name').map(function (input) { return input.value; });
       try {
-        var group = Store.createGroup(document.getElementById('groupName').value, memberNames);
+        var group = await Store.createGroup(document.getElementById('groupName').value, memberNames);
         closeModal();
         toast('Group “' + group.name + '” created.', 'success');
         navigate('group', { groupId: group.id });
@@ -2013,10 +2017,10 @@
 
       try {
         if (expenseId) {
-          Store.updateExpense(expenseId, payload);
+          await Store.updateExpense(expenseId, payload);
           toast('Expense updated.', 'success');
         } else {
-          Store.addExpense(payload);
+          await Store.addExpense(payload);
           toast('Expense added.', 'success');
         }
         closeModal();
@@ -2054,7 +2058,7 @@
           throw new Error('The most that can be settled between them is ' + money(maximum) + '.');
         }
 
-        Store.addSettlement({
+        await Store.addSettlement({
           groupId: settlementGroupId,
           from: fromId,
           to: toId,
@@ -2074,7 +2078,7 @@
       event.preventDefault();
       hideFormError('settingsError');
       try {
-        Store.updateProfile({
+        await Store.updateProfile({
           name: document.getElementById('settingsName').value,
           currency: document.getElementById('settingsCurrency').value
         });
@@ -2194,18 +2198,27 @@
     }
   }
 
-  function handleWindowStorage(event) {
-    if (event.key !== Store.storageKey) return;
-    Store.reload();
-    toast('Data refreshed from another tab.', 'info');
-    refreshAll();
+  var refreshInFlight = false;
+
+  function handleWindowFocus() {
+    if (document.visibilityState === 'hidden' || refreshInFlight) return;
+    if (document.body.classList.contains('modal-open')) return;
+
+    refreshInFlight = true;
+    Store.reload().then(function () {
+      refreshAll();
+    }).catch(function () {
+      // Keep the current view when the backend is temporarily unavailable.
+    }).then(function () {
+      refreshInFlight = false;
+    });
   }
 
   /* ------------------------------------------------------------------ */
   /* Boot                                                               */
   /* ------------------------------------------------------------------ */
 
-  function init() {
+  async function init() {
     els = {
       pageKicker: document.getElementById('pageKicker'),
       pageTitle: document.getElementById('pageTitle'),
@@ -2240,13 +2253,16 @@
     document.addEventListener('change', handleChange);
     document.addEventListener('submit', handleSubmit);
     document.addEventListener('keydown', handleKeydown);
-    window.addEventListener('storage', handleWindowStorage);
+    window.addEventListener('focus', handleWindowFocus);
+    document.addEventListener('visibilitychange', handleWindowFocus);
+
+    try {
+      await Store.init();
+    } catch (error) {
+      toast(error.message, 'error');
+    }
 
     navigate('dashboard');
-
-    if (!Store.storageInfo().persistent) {
-      toast('Local Storage is unavailable in this browser. Changes will not survive a refresh.', 'error');
-    }
   }
 
   document.addEventListener('DOMContentLoaded', init);
