@@ -1,0 +1,25 @@
+# Build output
+target/
+
+# Git metadata
+.git/
+.gitignore
+.gitattributes
+
+# IDE and OS files
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Local environment and logs
+.env
+.env.*
+*.log
+startup-log.txt
+HELP.md
+
+# Docker files
+Dockerfile
+.dockerignore
