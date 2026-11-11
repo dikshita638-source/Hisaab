@@ -2,7 +2,7 @@
   'use strict';
 
   var Core = global.HisaabCore;
-  var API_BASE = (global.HISAAB_API_BASE || 'http://localhost:8080/api').replace(/\/+$/, '');
+  var API_BASE = (global.HISAAB_API_BASE || 'https://hisaab-1-3pyv.onrender.com/api').replace(/\/+$/, '');
   var ME = 'me';
   var connected = false;
   var state = createDefaultState();
